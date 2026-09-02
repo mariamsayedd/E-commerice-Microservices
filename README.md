@@ -32,36 +32,35 @@ A Spring Boot / Spring Cloud e-commerce system built as three independent micros
                               └───────────────────┘
 ```
 
-Each service owns its own MySQL database — no shared tables, no cross-database foreign keys. Cross-service references (e.g. a `Product` existing in both `shopdb` and `inventorydb`) are kept in sync through Feign calls, not database-level joins.
+Each service owns its own MySQL database — no shared tables, no cross-database foreign keys. Cross-service references (e.g. a `Product` existing in both `shopdb` and `inventorydb`) are kept in sync through Feign calls, not database joins. shop-service also makes a plain outbound call to **Cloudinary** for product image storage — external to the service mesh above.
 
 ## Tech Stack
 
-- Java 21, Spring Boot 4.1.1, Maven
-- Spring Data JPA + MySQL (one database per service)
-- Spring Security + JWT (wallet-service issues tokens; shop/inventory verify them independently using a shared signing secret)
-- Spring Cloud Netflix Eureka (service discovery)
-- Spring Cloud OpenFeign (inter-service calls)
-- Resilience4j (circuit breakers on shop-service's calls to wallet-service and inventory-service)
-- Spring Cloud Gateway (single routed entry point, load-balanced via Eureka)
-- Spring Cloud Config Server (centralized `application.properties`, backed by a separate git repo: `ejada-config-repo`)
+| Layer | Technology |
+|---|---|
+| Language / build | Java 21, Maven |
+| Framework | Spring Boot 4.1.1 |
+| Persistence | Spring Data JPA, MySQL (one database per service) |
+| Auth | Spring Security, JWT — issued by wallet-service, independently verified by shop/inventory via a shared signing secret |
+| Service discovery | Spring Cloud Netflix Eureka |
+| Inter-service calls | Spring Cloud OpenFeign |
+| Resilience | Resilience4j (circuit breakers) |
+| Gateway | Spring Cloud Gateway (routing + Eureka-based load balancing) |
+| Config | Spring Cloud Config Server, backed by a separate `ejada-config-repo` |
+| Media storage | Cloudinary (product images) |
 
-## Repository Layout
+## Services
 
-```
-wallet-service/       User registration/login, wallet balance, deposit/withdraw, transaction history
-shop-service/         Categories, products, cart, orders, payment
-inventory-service/    Product stock tracking, synced automatically from shop-service via Feign
-eureka-server/        Service registry
-api-gateway/          Single entry point — routes /wallet-api, /shop-api, /inventory-api
-config-server/        Serves centralized config, backed by the separate ejada-config-repo
-database/             Reference SQL schema for all three databases (documentation only — see note below)
-```
-
-**Note on `database/`:** these `.sql` files document the schema as designed. Two columns (`users.role` and `products.image_url`) were added later via `ALTER TABLE` directly against the running databases — the files here have been updated to match, but they are not meant to be re-run against an existing database.
+| Service | Port | Responsibility |
+|---|---|---|
+| `eureka-server` | 8761 | Service registry |
+| `config-server` | 8888 | Centralized configuration |
+| `wallet-service` | 8081 | User auth, wallet balance, deposits/withdrawals, transaction history |
+| `shop-service` | 8082 | Categories, products, cart, orders, payment, product image uploads |
+| `inventory-service` | 8083 | Stock tracking, synced from shop-service via Feign |
+| `api-gateway` | 8765 | Single entry point, routes to all of the above |
 
 ## Data Model
-
-Full ERD available separately. Summary of ownership:
 
 | Database | Owned by | Tables |
 |---|---|---|
@@ -69,16 +68,36 @@ Full ERD available separately. Summary of ownership:
 | `shopdb` | shop-service | `categories`, `products`, `carts`, `cart_items`, `orders`, `order_items`, `payments` |
 | `inventorydb` | inventory-service | `products` (local copy), `inventory` |
 
+Reference schema lives in `database/` — documentation only, not meant to be re-run against an existing database.
+
 ## Authentication & Authorization
 
-- wallet-service issues JWTs on register/login, containing `user_id` and `role` (`USER` or `ADMIN`).
-- shop-service and inventory-service independently verify the same JWT (shared `jwt.secret`) rather than trusting a client-supplied header — no service trusts client-claimed identity.
-- Catalog-modifying endpoints (create/update/delete on categories, products, and inventory records) require `role = ADMIN`. Browsing (GET) is open to everyone. Cart/order/payment actions require any valid logged-in user's token.
-- The first admin account is promoted directly in the database (`UPDATE users SET role='ADMIN' WHERE email=...`) — self-registration deliberately cannot set its own role, since that would let anyone become an admin on signup.
+- wallet-service issues JWTs on register/login containing `user_id` and `role` (`USER` or `ADMIN`).
+- shop-service and inventory-service independently verify the same JWT rather than trusting any client-supplied identity header.
+- Catalog-modifying endpoints (create/update/delete on categories, products, inventory, and image uploads) require `role = ADMIN`. Browsing is open to everyone. Cart/order/payment actions require any valid logged-in user.
+- The first admin account is promoted directly in the database — self-registration cannot set its own role.
+
+## Product Images
+
+Images are uploaded to Cloudinary and referenced by URL — `products.image_url` stores a link, never the file itself.
+
+```
+POST /shop-api/images        (admin only, multipart/form-data, field: file)
+→ { "imageUrl": "https://res.cloudinary.com/.../products/xyz.jpg" }
+```
+
+That URL is then passed as `imageUrl` when creating or updating a product. Once uploaded, the link is permanent and public — viewable by anyone with no authentication, independent of whether any of our services are running.
+
+## Prerequisites
+
+- Java 21
+- MySQL 8+, running locally
+- A free [Cloudinary](https://cloudinary.com) account (for product image uploads)
+- The `ejada-config-repo` cloned locally
 
 ## Running the Project
 
-Start all six applications, in this order, waiting for each to finish starting before launching the next:
+Start all six applications in order, waiting for each to finish starting before launching the next:
 
 ```bash
 cd eureka-server && ./mvnw spring-boot:run
@@ -89,11 +108,18 @@ cd inventory-service && ./mvnw spring-boot:run
 cd api-gateway && ./mvnw spring-boot:run
 ```
 
-Config Server needs the separate `ejada-config-repo` cloned locally, with its path set in `config-server/src/main/resources/application.properties`.
+Before starting:
+- Set `spring.cloud.config.server.git.uri` in `config-server/application.properties` to your local path for `ejada-config-repo`.
+- Set `jwt.secret` (matching across wallet-service, shop-service, and inventory-service) and Cloudinary credentials in `shop-service/application.properties`.
+
+**Sanity checks once running:**
+- `http://localhost:8761` — all 5 non-Eureka services show as `UP`
+- `http://localhost:8888/wallet-service/default` — returns wallet-service's config as JSON
+- `http://localhost:8765/actuator/health` — Gateway reports `UP`
 
 ## Testing
 
-All requests are routed through the API Gateway (`localhost:8765`), using a path prefix per service:
+All requests are routed through the API Gateway (`localhost:8765`) using a path prefix per service:
 
 | Prefix | Routes to |
 |---|---|
@@ -101,13 +127,15 @@ All requests are routed through the API Gateway (`localhost:8765`), using a path
 | `/shop-api/**` | shop-service |
 | `/inventory-api/**` | inventory-service |
 
+A Postman collection covering every endpoint — including negative/security cases (missing token, wrong role, over-withdrawal) — is included separately.
+
 ## Resilience
 
-`shop-service`'s calls to `wallet-service` (payment) and `inventory-service` (product sync) are wrapped in Resilience4j circuit breakers. Current breaker states are visible at:
+shop-service's calls to wallet-service (payment) and inventory-service (product sync) are wrapped in Resilience4j circuit breakers:
 
 ```
 GET /shop-api/actuator/circuitbreakers
 GET /shop-api/actuator/circuitbreakerevents
 ```
 
-Stopping the target service and retrying a call several times trips the breaker to `OPEN` (fails fast instead of hanging); it transitions to `HALF_OPEN` after a cooldown and back to `CLOSED` once calls succeed again.
+Stopping the target service and retrying trips the breaker to `OPEN` (fails fast instead of hanging); it moves to `HALF_OPEN` after a cooldown and back to `CLOSED` once calls succeed again.
